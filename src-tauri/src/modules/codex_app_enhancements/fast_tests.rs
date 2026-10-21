@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 struct Options {
     api_service: bool,
+    preload_first: bool,
     profile_dir: PathBuf,
     draft_snapshot: Option<Value>,
     draft_approval_rejection: Option<&'static str>,
@@ -31,6 +32,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             api_service: false,
+            preload_first: false,
             profile_dir: PathBuf::new(),
             draft_snapshot: None,
             draft_approval_rejection: None,
@@ -90,6 +92,7 @@ async fn start(options: Options) -> Running {
     let startup = options.startup.clone();
     let profile_dir = options.profile_dir.clone();
     let api_service = options.api_service;
+    let preload_first = options.preload_first;
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
@@ -284,6 +287,7 @@ async fn start(options: Options) -> Running {
         true,
         true,
         api_service,
+        preload_first,
         startup,
         stop_rx,
     ));
@@ -366,6 +370,30 @@ fn assert_safe_protocol(calls: &[Value]) {
         .iter()
         .filter(|call| call["method"] == "Runtime.evaluate")
         .all(|call| call["params"]["contextId"] != 99));
+}
+
+#[tokio::test]
+async fn windows_preload_mode_never_reloads_an_already_rendered_page() {
+    let mut runtime = start(Options {
+        preload_first: true,
+        ..Options::default()
+    })
+    .await;
+    assert_eq!(
+        runtime
+            .notice("document", Some("restart-required"))
+            .await["state"],
+        "next-document"
+    );
+    let calls = runtime.finish(false).await;
+    assert_eq!(
+        expressions(
+            &calls,
+            "window.__cockpitNativeFast.reloadPreparedDocument()"
+        ),
+        0
+    );
+    assert_eq!(methods(&calls, "Page.addScriptToEvaluateOnNewDocument"), 1);
 }
 
 #[tokio::test]

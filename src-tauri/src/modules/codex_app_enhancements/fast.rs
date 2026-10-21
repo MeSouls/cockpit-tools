@@ -1,5 +1,6 @@
-//! Adapt native controls before their module loads. A newly launched profile
-//! may reload one clean document; restored sessions only prepare future pages.
+//! Adapt native controls before their module loads. Windows preloads the first
+//! document without a renderer reload; restored sessions only prepare future
+//! pages.
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -15,6 +16,7 @@ use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 const GUARD_SCRIPT: &str = include_str!("startup_guard.js");
+const PRELOAD_SCRIPT: &str = include_str!("startup_preload.js");
 const SCRIPT: &str = include_str!("fast.js");
 const QUOTA_SCRIPT: &str = include_str!("quota.js");
 const STATE_SCRIPT: &str = r#";(() => {
@@ -296,6 +298,8 @@ struct Registration {
     script_id: Option<String>,
     owner: String,
     runtime: String,
+    startup_runtime: String,
+    preload_first: bool,
     nonce: String,
     startup: Option<Arc<StartupReload>>,
     draft_file: PathBuf,
@@ -475,6 +479,33 @@ async fn rollback_preparation(registration: &mut Registration) {
     registration.script_id = None;
 }
 
+async fn prepare_startup_preload(
+    registration: &mut Registration,
+    reason: &str,
+) -> Result<(), String> {
+    let reply = registration
+        .session()
+        .command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({"source":registration.startup_runtime.as_str()}),
+            COMMAND_TIMEOUT,
+        )
+        .await?;
+    registration.script_id = reply
+        .pointer("/result/identifier")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "registration-failed".to_string())?;
+    registration.document.done = true;
+    // The preload script performs the first activation. Never request a second
+    // document: Windows treats that renderer reload as a new cold start and can
+    // leave the application on its startup loader.
+    registration.startup = None;
+    registration.report("document", reason).await;
+    Ok(())
+}
+
 async fn prepare_future_document(
     registration: &mut Registration,
     context: ContextKey,
@@ -579,6 +610,13 @@ async fn try_startup_reload(registration: &mut Registration, context: ContextKey
         registration.startup = None;
         registration
             .report("document", "startup-permission-expired")
+            .await;
+        return;
+    }
+    if registration.preload_first {
+        registration.startup = None;
+        registration
+            .report("document", "restart-required")
             .await;
         return;
     }
@@ -786,6 +824,15 @@ async fn maintain(registration: &mut Registration) -> Result<(), String> {
             .evaluate("location.href".to_string(), context, COMMAND_TIMEOUT)
             .await?;
         if !location.as_str().is_some_and(local_document) {
+            if registration.preload_first
+                && registration.startup.is_some()
+                && location
+                    .as_str()
+                    .is_some_and(|value| value.is_empty() || value == "about:blank")
+            {
+                prepare_startup_preload(registration, "preload-armed").await?;
+                return Ok(());
+            }
             return Err("native enhancement requires a local application target".to_string());
         }
         let expression = format!("(()=>{{const p=window.__cockpitNativeFast;return window.__cockpitEnhancements?.owner==={}&&typeof p?.prepareHandoff==='function'&&typeof p?.consumeHandoff==='function'&&typeof p?.cancelHandoff==='function';}})()", json!(registration.owner));
@@ -877,6 +924,7 @@ pub(super) async fn run(
     quota_compat: bool,
     api_key_auth_verified: bool,
     api_service: bool,
+    preload_first: bool,
     startup: Option<Arc<StartupReload>>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), String> {
@@ -909,6 +957,7 @@ pub(super) async fn run(
         api_service,
         &owner,
     );
+    let startup_runtime = format!("{runtime}\n{PRELOAD_SCRIPT}");
     let mut registration = Registration {
         session: Some(Session {
             socket,
@@ -923,6 +972,8 @@ pub(super) async fn run(
         script_id: None,
         owner,
         runtime,
+        startup_runtime,
+        preload_first,
         nonce: uuid::Uuid::new_v4().to_string(),
         startup,
         draft_file: profile_dir.join(".codex-global-state.json"),

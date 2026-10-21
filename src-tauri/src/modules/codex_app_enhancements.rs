@@ -43,7 +43,12 @@ pub fn start_for_profile(
     }
     let startup = fresh_launch.then(|| Arc::new(fast::StartupReload::new()));
     tauri::async_runtime::spawn(run_profile(
-        profile, instance, port, startup, api_service, receiver,
+        profile,
+        instance,
+        port,
+        startup,
+        api_service,
+        receiver,
     ));
 }
 
@@ -174,7 +179,11 @@ fn safe_socket(value: &str, port: u16) -> bool {
         && url.path().starts_with("/devtools/page/")
 }
 
-async fn targets(client: &reqwest::Client, port: u16) -> Option<HashSet<String>> {
+async fn targets(
+    client: &reqwest::Client,
+    port: u16,
+    include_pending: bool,
+) -> Option<HashSet<String>> {
     let response = client
         .get(format!("http://127.0.0.1:{port}/json/list"))
         .send()
@@ -191,7 +200,9 @@ async fn targets(client: &reqwest::Client, port: u16) -> Option<HashSet<String>>
             .into_iter()
             .filter(|target| {
                 matches!(target.kind.as_str(), "page" | "webview")
-                    && target.url.starts_with("app://-/")
+                    && (target.url.starts_with("app://-/")
+                        || include_pending
+                            && (target.url.is_empty() || target.url == "about:blank"))
             })
             .filter_map(|target| target.socket.filter(|socket| safe_socket(socket, port)))
             .collect(),
@@ -286,7 +297,8 @@ async fn run_profile(
         let Some(profile) = current.as_ref().filter(|profile| profile.active() || api_service) else {
             continue;
         };
-        let Some(available) = targets(&client, port).await else {
+        let preload_first = cfg!(target_os = "windows") && startup.is_some();
+        let Some(available) = targets(&client, port, preload_first).await else {
             continue;
         };
         let ended: Vec<_> = children
@@ -322,6 +334,7 @@ async fn run_profile(
                     profile.quota_compat,
                     profile.api_key_auth_verified,
                     api_service,
+                    preload_first,
                     startup,
                     receiver,
                 )

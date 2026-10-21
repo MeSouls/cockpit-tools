@@ -649,7 +649,7 @@ pub fn start_for_profile(
     start_profile(app, instance_id, profile_dir, port, bind_account_id, false);
 }
 
-/// Only the unified launch transaction grants one clean startup reload.
+/// Only the unified launch transaction may arm first-document adaptation.
 pub fn start_for_launched_profile(
     app: AppHandle,
     instance_id: String,
