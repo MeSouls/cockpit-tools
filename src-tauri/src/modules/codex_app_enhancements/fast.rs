@@ -483,20 +483,23 @@ async fn prepare_startup_preload(
     registration: &mut Registration,
     reason: &str,
 ) -> Result<(), String> {
+    let source = registration.startup_runtime.clone();
     let reply = registration
         .session()
         .command(
             "Page.addScriptToEvaluateOnNewDocument",
-            json!({"source":registration.startup_runtime.as_str()}),
+            json!({"source":source}),
             COMMAND_TIMEOUT,
         )
         .await?;
-    registration.script_id = reply
-        .pointer("/result/identifier")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| "registration-failed".to_string())?;
+    registration.script_id = Some(
+        reply
+            .pointer("/result/identifier")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "registration-failed".to_string())?,
+    );
     registration.document.done = true;
     // The preload script performs the first activation. Never request a second
     // document: Windows treats that renderer reload as a new cold start and can
