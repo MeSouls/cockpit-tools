@@ -233,6 +233,7 @@ async fn run_profile(
     api_service: bool,
     mut stop: watch::Receiver<bool>,
 ) {
+    let preload_first = cfg!(target_os = "windows") && startup.is_some();
     let Ok(client) = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
@@ -241,6 +242,37 @@ async fn run_profile(
     else {
         return;
     };
+    if preload_first {
+        let preload_profile = profile_or_api_fallback(
+            tokio::task::spawn_blocking({
+                let path = profile_dir.clone();
+                move || read_profile(&path)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok),
+            api_service,
+        );
+        if let Some(profile) = preload_profile {
+            let preload_stop = stop.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = fast::preload_browser(
+                    port,
+                    profile.native_fast,
+                    profile.quota_compat,
+                    profile.api_key_auth_verified,
+                    api_service,
+                    preload_stop,
+                )
+                .await
+                {
+                    logger::log_warn(&format!(
+                        "[Codex enhancements] browser preload failed: {error}"
+                    ));
+                }
+            });
+        }
+    }
     let mut children: HashMap<String, Child> = HashMap::new();
     let mut retry_at: HashMap<String, Instant> = HashMap::new();
     let mut current = profile_or_api_fallback(None, api_service);
@@ -297,7 +329,6 @@ async fn run_profile(
         let Some(profile) = current.as_ref().filter(|profile| profile.active() || api_service) else {
             continue;
         };
-        let preload_first = cfg!(target_os = "windows") && startup.is_some();
         let Some(available) = targets(&client, port, preload_first).await else {
             continue;
         };

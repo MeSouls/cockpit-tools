@@ -3,6 +3,7 @@
 //! pages.
 
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -57,6 +58,163 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ContextKey = (u64, i64);
 #[path = "startup_draft.rs"]
 mod startup_draft;
+
+struct BrowserSession {
+    socket: Socket,
+    command_id: u64,
+}
+
+impl BrowserSession {
+    async fn send(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+    ) -> Result<u64, String> {
+        self.command_id += 1;
+        let mut message = json!({"id":self.command_id,"method":method,"params":params});
+        if let Some(session_id) = session_id {
+            message["sessionId"] = json!(session_id);
+        }
+        self.socket
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .map_err(|_| "browser preload transport failed".to_string())?;
+        Ok(self.command_id)
+    }
+}
+
+#[derive(Deserialize)]
+struct BrowserVersion {
+    #[serde(rename = "webSocketDebuggerUrl")]
+    socket: String,
+}
+
+fn safe_browser_socket(value: &str, port: u16) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "ws"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port() == Some(port)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().starts_with("/devtools/browser/")
+}
+
+/// Arms first-document adaptation from Chromium's browser endpoint. Windows
+/// does not expose the pre-navigation page through `/json/list`, so attaching
+/// only after the app URL appears is already too late for a reload-free start.
+pub(super) async fn preload_browser(
+    port: u16,
+    native_fast: bool,
+    quota_compat: bool,
+    api_key_auth_verified: bool,
+    api_service: bool,
+    mut stop: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "browser preload client failed".to_string())?;
+    let version = loop {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{port}/json/version"))
+            .send()
+            .await
+        {
+            if let Ok(version) = response.json::<BrowserVersion>().await {
+                if safe_browser_socket(&version.socket, port) {
+                    break version;
+                }
+            }
+        }
+        tokio::select! {
+            _ = stop.changed() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    };
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(64 * 1024 * 1024))
+        .max_frame_size(Some(64 * 1024 * 1024));
+    let (socket, _) = timeout(
+        COMMAND_TIMEOUT,
+        connect_async_with_config(version.socket, Some(config), false),
+    )
+    .await
+    .map_err(|_| "browser preload connection timed out".to_string())?
+    .map_err(|_| "browser preload connection failed".to_string())?;
+    let owner = format!("preload-{port}");
+    let runtime = bootstrap(
+        native_fast,
+        quota_compat,
+        api_key_auth_verified,
+        api_service,
+        &owner,
+    );
+    let mut session = BrowserSession {
+        socket,
+        command_id: 0,
+    };
+    session
+        .send("Target.setDiscoverTargets", json!({"discover":true}), None)
+        .await?;
+    session
+        .send(
+            "Target.setAutoAttach",
+            json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}),
+            None,
+        )
+        .await?;
+    let mut registered = HashSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { break; }
+            }
+            message = session.socket.next() => {
+                let Some(message) = message else { break; };
+                let message = message.map_err(|_| "browser preload transport failed".to_string())?;
+                let Message::Text(text) = message else { continue; };
+                let event: Value = serde_json::from_str(&text)
+                    .map_err(|_| "browser preload invalid response".to_string())?;
+                if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
+                    continue;
+                }
+                let Some(session_id) = event.pointer("/params/sessionId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let target = &event["params"]["targetInfo"];
+                if target.get("type").and_then(Value::as_str) != Some("page")
+                    || !registered.insert(session_id.to_string())
+                {
+                    continue;
+                }
+                let target_id = target.get("targetId").and_then(Value::as_str).unwrap_or("unknown");
+                session
+                    .send(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        json!({"source":runtime.as_str()}),
+                        Some(session_id),
+                    )
+                    .await?;
+                crate::modules::logger::log_info(&format!(
+                    "[CodexEnhancements] startup preload attached: target={target_id}"
+                ));
+            }
+        }
+    }
+    let _ = session.socket.close(None).await;
+    Ok(())
+}
 
 /// Shared by every target/worker of one explicit profile launch. Reconnection
 /// and configuration changes must not create another startup permission.
