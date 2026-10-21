@@ -3,6 +3,19 @@ use std::sync::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+#[test]
+fn live_quota_condition_requires_valid_minified_locals() {
+    assert_eq!(valid_quota_identifier(Some("Ct")), Some("Ct"));
+    assert_eq!(valid_quota_identifier(Some("$gate")), Some("$gate"));
+    for invalid in [None, Some(""), Some("1gate"), Some("a-b"), Some("a;alert(1)")] {
+        assert_eq!(valid_quota_identifier(invalid), None);
+    }
+    assert_eq!(
+        live_quota_condition("Ct", "vn"),
+        "(window.__cockpitEnhancements?.apiService===true&&window.__cockpitEnhancements?.quotaCompat===true&&(Ct=false,vn=false),false)"
+    );
+}
+
 struct Options {
     api_service: bool,
     preload_first: bool,
@@ -1307,6 +1320,15 @@ fn transport_and_asset_boundaries_reject_remote_or_ambiguous_targets() {
     assert!(!local_document("app://external/index.html"));
     assert!(local_initial("app://-/assets/app-initial-valid.js"));
     assert!(!local_initial("app://-/assets/app-initial-valid.js?other"));
+    assert!(local_primary("app://-/assets/app-primary-98d23d806dbd.js"));
+    for value in [
+        "https://example.com/assets/app-primary-valid.js",
+        "app://-/assets/app-initial-valid.js",
+        "app://-/assets/app-primary-valid.js?other",
+        "app://-/assets/app-primary-valid.js#fragment",
+    ] {
+        assert!(!local_primary(value), "{value}");
+    }
 }
 
 #[tokio::test]
@@ -1315,6 +1337,7 @@ async fn disabled_and_stopped_sessions_do_not_connect() {
     assert!(run(
         "invalid".to_string(),
         PathBuf::new(),
+        false,
         false,
         false,
         false,
@@ -1331,6 +1354,7 @@ async fn disabled_and_stopped_sessions_do_not_connect() {
         true,
         true,
         true,
+        false,
         false,
         None,
         receiver

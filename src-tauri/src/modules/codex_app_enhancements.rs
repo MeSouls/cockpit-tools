@@ -233,7 +233,11 @@ async fn run_profile(
     api_service: bool,
     mut stop: watch::Receiver<bool>,
 ) {
-    let preload_first = cfg!(target_os = "windows") && startup.is_some();
+    // API-service launches use the live quota breakpoint path. Its TCP CDP
+    // endpoint becomes available after the first navigation, so a startup
+    // preload cannot win that race and must not trigger a renderer reload.
+    let preload_first =
+        cfg!(target_os = "windows") && startup.is_some() && !api_service;
     let Ok(client) = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))

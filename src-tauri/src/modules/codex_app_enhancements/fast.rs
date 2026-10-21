@@ -32,7 +32,7 @@ const STATE_SCRIPT: &str = r#";(() => {
     window.__cockpitNativeDictation.capability = nativeValue => nativeValue;
   const features = [next.nativeFast, next.quotaCompat, next.apiKeyAuthVerified, next.apiService].map(Number).join('');
   const active = previous?.nativePatchState === 'active'
-    && previous.nativePatchMode === 'full'
+    && ['full', 'live-quota'].includes(previous.nativePatchMode)
     && previous.nativePatchRequestedFeatures === features
     && previous.nativePatchFeatures === features;
   const sameOwnerAndConfig = previous?.owner === next.owner
@@ -458,11 +458,15 @@ struct Registration {
     runtime: String,
     startup_runtime: String,
     preload_first: bool,
+    live_quota: bool,
+    live_quota_armed: bool,
+    breakpoint_id: Option<String>,
     nonce: String,
     startup: Option<Arc<StartupReload>>,
     draft_file: PathBuf,
     context: Option<ContextKey>,
     document: Attempt,
+    live_quota_attempt: Attempt,
     bootstrapped: bool,
     active: bool,
     capability_only: bool,
@@ -484,6 +488,7 @@ impl Registration {
             cleanup(
                 &mut session,
                 self.script_id.take(),
+                self.breakpoint_id.take(),
                 &self.owner,
                 &self.nonce,
             )
@@ -535,21 +540,40 @@ impl Drop for Registration {
             return;
         };
         let script_id = self.script_id.take();
+        let breakpoint_id = self.breakpoint_id.take();
         let owner = self.owner.clone();
         let nonce = self.nonce.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                cleanup(&mut session, script_id, &owner, &nonce).await;
+                cleanup(&mut session, script_id, breakpoint_id, &owner, &nonce).await;
             });
         }
     }
 }
 
-async fn cleanup(session: &mut Session, script_id: Option<String>, owner: &str, nonce: &str) {
+async fn cleanup(
+    session: &mut Session,
+    script_id: Option<String>,
+    breakpoint_id: Option<String>,
+    owner: &str,
+    nonce: &str,
+) {
     let _ = timeout(CLEANUP_TIMEOUT, async {
         if let Some(context) = session.context() {
-            let expression = format!("(()=>{{const s=window.__cockpitEnhancements;if(s?.owner==={}){{window.__cockpitNativeFast?.cancelHandoff?.({});s.nativeFast=false;s.quotaCompat=false;s.apiService=false;window.__cockpitNativeFastDispose?.();}}return true;}})()", json!(owner), json!(nonce));
+            let expression = format!("(()=>{{const s=window.__cockpitEnhancements;if(s?.owner==={}){{window.__cockpitQuotaCompat?.disposeLiveQuotaGuard?.();window.__cockpitNativeFast?.cancelHandoff?.({});s.nativeFast=false;s.quotaCompat=false;s.apiService=false;window.__cockpitNativeFastDispose?.();}}return true;}})()", json!(owner), json!(nonce));
             let _ = session.evaluate(expression, context, Duration::from_millis(500)).await;
+        }
+        if let Some(breakpoint_id) = breakpoint_id {
+            let _ = session
+                .command(
+                    "Debugger.removeBreakpoint",
+                    json!({"breakpointId":breakpoint_id}),
+                    Duration::from_millis(500),
+                )
+                .await;
+            let _ = session
+                .command("Debugger.disable", json!({}), Duration::from_millis(500))
+                .await;
         }
         if let Some(identifier) = script_id { session.registrations.insert(identifier); }
         loop {
@@ -585,6 +609,10 @@ fn safe_reason(value: &Value, fallback: &str) -> String {
 fn command_reason(error: &str) -> String {
     let operation = if error.ends_with("Page.addScriptToEvaluateOnNewDocument") {
         "registration"
+    } else if error.ends_with("Debugger.enable") {
+        "debugger-enable"
+    } else if error.ends_with("Debugger.setBreakpointByUrl") {
+        "breakpoint-registration"
     } else if error.ends_with("Runtime.evaluate") || error.contains("evaluation") {
         "evaluation"
     } else {
@@ -649,7 +677,8 @@ async fn prepare_startup_preload(
             json!({"source":source}),
             COMMAND_TIMEOUT,
         )
-        .await?;
+        .await
+        .map_err(|error| command_reason(&error))?;
     registration.script_id = Some(
         reply
             .pointer("/result/identifier")
@@ -950,6 +979,162 @@ async fn read_activation(
     Ok(())
 }
 
+fn valid_quota_identifier(value: Option<&str>) -> Option<&str> {
+    value.filter(|name| {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| {
+                    byte == b'_' || byte == b'$' || byte.is_ascii_alphanumeric()
+                        && (index > 0 || !byte.is_ascii_digit())
+                })
+    })
+}
+
+fn live_quota_condition(hard: &str, guard: &str) -> String {
+    format!(
+        "(window.__cockpitEnhancements?.apiService===true&&window.__cockpitEnhancements?.quotaCompat===true&&({hard}=false,{guard}=false),false)"
+    )
+}
+
+async fn register_live_runtime(
+    registration: &mut Registration,
+    context: ContextKey,
+) -> Result<(), String> {
+    let source = registration.runtime.clone();
+    let reply = registration
+        .session()
+        .command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({"source":source}),
+            COMMAND_TIMEOUT,
+        )
+        .await
+        .map_err(|error| command_reason(&error))?;
+    if registration.session().context() != Some(context) {
+        return Err("context-changed".to_string());
+    }
+    registration.script_id = Some(
+        reply
+            .pointer("/result/identifier")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "registration-failed".to_string())?,
+    );
+    registration.report("document", "live-runtime-registered").await;
+    Ok(())
+}
+
+async fn arm_live_quota_guard(
+    registration: &mut Registration,
+    context: ContextKey,
+) -> Result<(), String> {
+    let plan = registration
+        .session()
+        .evaluate(
+            "window.__cockpitQuotaCompat.prepareLiveQuotaGate()".to_string(),
+            context,
+            PREPARE_TIMEOUT,
+        )
+        .await
+        .map_err(|error| command_reason(&error))?;
+    if registration.session().context() != Some(context) {
+        return Err("context-changed".to_string());
+    }
+    if plan.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(safe_reason(&plan, "quota-location-unavailable"));
+    }
+    let location = plan
+        .get("plan")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| "quota-location-invalid".to_string())?;
+    let url = location
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|value| local_primary(value))
+        .ok_or_else(|| "quota-location-invalid".to_string())?;
+    let line = location
+        .get("lineNumber")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= u32::MAX as u64)
+        .ok_or_else(|| "quota-location-invalid".to_string())?;
+    let column = location
+        .get("columnNumber")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= u32::MAX as u64)
+        .ok_or_else(|| "quota-location-invalid".to_string())?;
+    let hard = valid_quota_identifier(
+        location
+            .get("hardVariable")
+            .and_then(Value::as_str),
+    )
+    .ok_or_else(|| "quota-location-invalid".to_string())?;
+    let guard = valid_quota_identifier(
+        location
+            .get("guardVariable")
+            .and_then(Value::as_str),
+    )
+    .ok_or_else(|| "quota-location-invalid".to_string())?;
+    if registration.breakpoint_id.is_none() {
+        registration
+            .session()
+            .command(
+                "Debugger.enable",
+                json!({}),
+                Duration::from_secs(15),
+            )
+            .await
+            .map_err(|error| command_reason(&error))?;
+        let reply = registration
+            .session()
+            .command(
+                "Debugger.setBreakpointByUrl",
+                json!({
+                    "lineNumber":line,
+                    "columnNumber":column,
+                    "urlRegex":format!("^{}$", regex::escape(url)),
+                    "condition":live_quota_condition(hard, guard),
+                }),
+                Duration::from_secs(15),
+            )
+            .await
+            .map_err(|error| command_reason(&error))?;
+        registration.breakpoint_id = Some(
+            reply
+                .pointer("/result/breakpointId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| "breakpoint-registration-failed".to_string())?,
+        );
+    }
+    let expression = format!(
+        "window.__cockpitQuotaCompat.installLiveQuotaGuard({})",
+        location
+    );
+    let installed = registration
+        .session()
+        .evaluate(expression, context, COMMAND_TIMEOUT)
+        .await
+        .map_err(|error| command_reason(&error))?;
+    if registration.session().context() != Some(context) {
+        return Err("context-changed".to_string());
+    }
+    if installed.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(safe_reason(&installed, "quota-live-install-failed"));
+    }
+    registration.live_quota_armed = true;
+    registration.active = true;
+    registration.activation_until = None;
+    registration
+        .report("activation", "quota-breakpoint-armed")
+        .await;
+    Ok(())
+}
+
 async fn maintain(registration: &mut Registration) -> Result<(), String> {
     let Some(context) = registration.session().context() else {
         return Ok(());
@@ -965,6 +1150,8 @@ async fn maintain(registration: &mut Registration) -> Result<(), String> {
         registration.bootstrapped = false;
         registration.active = false;
         registration.capability_only = false;
+        registration.live_quota_armed = false;
+        registration.live_quota_attempt = Attempt::default();
         registration.next_state_read = None;
         registration.last_diagnostic = None;
         registration.activation_until = registration
@@ -989,6 +1176,9 @@ async fn maintain(registration: &mut Registration) -> Result<(), String> {
             }
             return Err("native enhancement requires a local application target".to_string());
         }
+        if registration.live_quota && !location.as_str().is_some_and(local_main_document) {
+            return Ok(());
+        }
         let expression = format!("(()=>{{const p=window.__cockpitNativeFast;return window.__cockpitEnhancements?.owner==={}&&typeof p?.prepareHandoff==='function'&&typeof p?.consumeHandoff==='function'&&typeof p?.cancelHandoff==='function';}})()", json!(registration.owner));
         let installed = registration
             .session()
@@ -1008,6 +1198,42 @@ async fn maintain(registration: &mut Registration) -> Result<(), String> {
         }
         registration.bootstrapped = true;
         read_activation(registration, context).await?;
+    }
+    if registration.live_quota {
+        if registration.script_id.is_none()
+            && registration.document.due()
+            && registration.session().pending_additions.is_empty()
+        {
+            match register_live_runtime(registration, context).await {
+                Ok(()) => registration.document.done = true,
+                Err(reason) => {
+                    registration.document.failed(matches!(
+                        reason.as_str(),
+                        "context-changed" | "evaluation-timeout" | "transport-failed"
+                    ));
+                    registration.report("document", &reason).await;
+                }
+            }
+        }
+        if !registration.live_quota_armed && registration.live_quota_attempt.due() {
+            match arm_live_quota_guard(registration, context).await {
+                Ok(()) => {}
+                Err(reason) => {
+                    let retryable = matches!(
+                        reason.as_str(),
+                        "quota-location-failed"
+                            | "quota-location-unavailable"
+                            | "context-changed"
+                            | "evaluation-timeout"
+                            | "transport-failed"
+                    ) || reason.starts_with("debugger-enable-")
+                        || reason.starts_with("breakpoint-registration-");
+                    registration.live_quota_attempt.failed(retryable);
+                    registration.report("activation", &reason).await;
+                }
+            }
+        }
+        return Ok(());
     }
     if registration.script_id.is_none()
         && registration.document.due()
@@ -1112,6 +1338,7 @@ pub(super) async fn run(
         &owner,
     );
     let startup_runtime = format!("{runtime}\n{PRELOAD_SCRIPT}");
+    let live_quota = cfg!(all(target_os = "windows", not(test))) && api_service && quota_compat;
     let mut registration = Registration {
         session: Some(Session {
             socket,
@@ -1128,11 +1355,15 @@ pub(super) async fn run(
         runtime,
         startup_runtime,
         preload_first,
+        live_quota,
+        live_quota_armed: false,
+        breakpoint_id: None,
         nonce: uuid::Uuid::new_v4().to_string(),
         startup,
         draft_file: profile_dir.join(".codex-global-state.json"),
         context: None,
         document: Attempt::default(),
+        live_quota_attempt: Attempt::default(),
         bootstrapped: false,
         active: false,
         capability_only: false,
@@ -1194,6 +1425,17 @@ fn local_document(value: &str) -> bool {
         && url.password().is_none()
 }
 
+fn local_main_document(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    local_document(value)
+        && url.path() == "/index.html"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+}
+
 fn local_initial(value: &str) -> bool {
     let Ok(url) = url::Url::parse(value) else {
         return false;
@@ -1206,6 +1448,20 @@ fn local_initial(value: &str) -> bool {
         && name.starts_with("app-initial-")
         && name.ends_with(".js")
         && name.len() > "app-initial-.js".len()
+}
+
+fn local_primary(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    let name = url.path().rsplit('/').next().unwrap_or_default();
+    local_document(value)
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().contains("/assets/")
+        && name.starts_with("app-primary-")
+        && name.ends_with(".js")
+        && name.len() > "app-primary-.js".len()
 }
 
 #[cfg(test)]
