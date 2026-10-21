@@ -3118,6 +3118,16 @@ async fn codex_start_instance_internal(
             default_bind_account_id.as_deref(),
         ).await?;
         launch_proxy.append_electron_args(&mut injection_plan.args);
+        if cfg!(target_os = "windows")
+            && default_bind_account_id
+                .as_deref()
+                .is_some_and(modules::codex_instance::is_api_service_bind_account_id)
+        {
+            // The Windows client's meta CSP rejects the temporary import-map
+            // modules. Scope the test compatibility switch to API-service
+            // instances, never to ordinary Codex account windows.
+            injection_plan.args.push("--disable-web-security".to_string());
+        }
         emit_codex_instance_launch_step(
             &app,
             emit_launch_progress,
@@ -3428,6 +3438,14 @@ async fn codex_start_instance_internal(
         instance.bind_account_id.as_deref(),
     ).await?;
     launch_proxy.append_electron_args(&mut injection_plan.args);
+    if cfg!(target_os = "windows")
+        && instance
+            .bind_account_id
+            .as_deref()
+            .is_some_and(modules::codex_instance::is_api_service_bind_account_id)
+    {
+        injection_plan.args.push("--disable-web-security".to_string());
+    }
     emit_codex_instance_launch_step(
         &app,
         emit_launch_progress,

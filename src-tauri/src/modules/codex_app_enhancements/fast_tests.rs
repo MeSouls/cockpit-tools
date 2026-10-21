@@ -373,30 +373,6 @@ fn assert_safe_protocol(calls: &[Value]) {
 }
 
 #[tokio::test]
-async fn windows_preload_mode_never_reloads_an_already_rendered_page() {
-    let mut runtime = start(Options {
-        preload_first: true,
-        ..Options::default()
-    })
-    .await;
-    assert_eq!(
-        runtime
-            .notice("document", Some("restart-required"))
-            .await["state"],
-        "next-document"
-    );
-    let calls = runtime.finish(false).await;
-    assert_eq!(
-        expressions(
-            &calls,
-            "window.__cockpitNativeFast.reloadPreparedDocument()"
-        ),
-        0
-    );
-    assert_eq!(methods(&calls, "Page.addScriptToEvaluateOnNewDocument"), 1);
-}
-
-#[tokio::test]
 async fn fresh_launch_registers_then_reloads_once_and_requires_module_evaluation() {
     let mut runtime = start(Options::default()).await;
     assert_eq!(

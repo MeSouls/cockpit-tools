@@ -774,13 +774,6 @@ async fn try_startup_reload(registration: &mut Registration, context: ContextKey
             .await;
         return;
     }
-    if registration.preload_first {
-        registration.startup = None;
-        registration
-            .report("document", "restart-required")
-            .await;
-        return;
-    }
     if registration
         .next_startup_check
         .is_some_and(|next| Instant::now() < next)
