@@ -243,16 +243,26 @@ async fn run_profile(
         return;
     };
     if preload_first {
-        let preload_profile = profile_or_api_fallback(
-            tokio::task::spawn_blocking({
-                let path = profile_dir.clone();
-                move || read_profile(&path)
+        // The API-service binding is already verified by the launch transaction.
+        // Waiting for the keyring/profile reader here lets the page navigate
+        // before Chromium auto-attaches, which defeats first-document preload.
+        let preload_profile = if api_service {
+            Some(Profile {
+                quota_compat: true,
+                ..Profile::default()
             })
-            .await
-            .ok()
-            .and_then(Result::ok),
-            api_service,
-        );
+        } else {
+            profile_or_api_fallback(
+                tokio::task::spawn_blocking({
+                    let path = profile_dir.clone();
+                    move || read_profile(&path)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok),
+                false,
+            )
+        };
         if let Some(profile) = preload_profile {
             let preload_stop = stop.clone();
             tauri::async_runtime::spawn(async move {
